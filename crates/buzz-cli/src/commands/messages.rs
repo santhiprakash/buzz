@@ -149,9 +149,34 @@ fn resolve_names_to_pubkeys(
     Ok(resolved)
 }
 
+/// Resolve the `channel_type` value from a kind:39000 channel metadata event.
+///
+/// Returns `None` when the metadata event is unavailable or has no `t` tag.
+async fn resolve_channel_type(client: &BuzzClient, channel_id: &str) -> Option<String> {
+    let filter = serde_json::json!({
+        "kinds": [39000],
+        "#d": [channel_id],
+        "limit": 1,
+    });
+    let events = fetch_events(client, &filter).await?;
+    let event = events.first()?;
+    let tags = event.get("tags").and_then(|t| t.as_array())?;
+    for tag in tags {
+        let arr = tag.as_array()?;
+        if arr.first()?.as_str()? == "t" {
+            return arr.get(1)?.as_str().map(str::to_string);
+        }
+    }
+    None
+}
+
 /// Resolve mention text against the channel membership snapshot.
 ///
 /// Returns both the current member set and uniquely name-resolved pubkeys.
+/// `load_members` forces a membership fetch even when the content has no
+/// explicit or `@`-style mentions; this is needed for DM sends so the
+/// counterparty can be p-tagged without requiring an `@mention`.
+///
 /// Lookup failures are fatal when mention processing is requested: publishing
 /// visible mention text without its intended `p` tag is worse than not sending.
 async fn resolve_content_mentions(
@@ -159,9 +184,10 @@ async fn resolve_content_mentions(
     channel_id: &str,
     content: &str,
     has_explicit_mentions: bool,
+    load_members: bool,
 ) -> Result<(Vec<String>, Vec<String>), CliError> {
     let stripped = strip_code_regions(content);
-    if !stripped.contains('@') && !has_explicit_mentions {
+    if !load_members && !stripped.contains('@') && !has_explicit_mentions {
         return Ok((vec![], vec![]));
     }
 
@@ -594,9 +620,33 @@ pub async fn cmd_send_message(
     // Uniquely resolvable member names still add their own p-tags; callers must supply
     // every intended identity whose visible label cannot be resolved uniquely.
     let has_explicit_mentions = !explicit_mentions.is_empty() || !uri_pubkeys.is_empty();
-    let (member_pubkeys, auto_resolved) =
-        resolve_content_mentions(client, &p.channel_id, &p.content, has_explicit_mentions).await?;
-    let mention_pubkeys = merge_message_mentions(&explicit_mentions, &uri_pubkeys, &auto_resolved)?;
+
+    // DM sends must p-tag the counterparties even when the content has no
+    // explicit mention. Load membership and channel metadata to identify DMs.
+    let is_dm = resolve_channel_type(client, &p.channel_id).await.as_deref() == Some("dm");
+    let (member_pubkeys, auto_resolved) = resolve_content_mentions(
+        client,
+        &p.channel_id,
+        &p.content,
+        has_explicit_mentions,
+        is_dm,
+    )
+    .await?;
+
+    // For DMs, automatically include the other participants in the p-tag set.
+    // This matches Desktop and lets `buzz dms list` / p-tag classifiers discover
+    // the message without requiring an `@mention` in the content.
+    let mut resolved = auto_resolved;
+    if is_dm {
+        let my_pk = client.keys().public_key().to_hex();
+        for pk in &member_pubkeys {
+            if *pk != my_pk && !resolved.contains(pk) {
+                resolved.push(pk.clone());
+            }
+        }
+    }
+
+    let mention_pubkeys = merge_message_mentions(&explicit_mentions, &uri_pubkeys, &resolved)?;
 
     let missing = missing_members(&mention_pubkeys, &member_pubkeys);
     if !missing.is_empty() {
@@ -993,14 +1043,23 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        event_mention_pubkeys, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys,
+        cmd_send_message, event_mention_pubkeys, find_root_from_tags, match_profiles_by_name,
+        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        resolve_names_to_pubkeys, SendMessageParams,
+    };
+    use crate::client::BuzzClient;
+    use axum::{
+        body::Bytes, extract::State, http::StatusCode, response::IntoResponse, routing::post, Json,
+        Router,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
     };
+    use nostr::Keys;
     use serde_json::json;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1371,5 +1430,211 @@ mod tests {
             profile_event(PK_VALID_A, Some("Aaron"), None),
         ];
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // DM send integration tests — prove auto p-tag emission end-to-end.
+    // ------------------------------------------------------------------
+
+    /// A real 64-char hex pubkey used as the DM peer in send tests.
+    /// It is accepted by `PublicKey::from_hex` and is not the sender's key.
+    const DM_PEER_PK: &str = PK_VALID_B;
+
+    #[derive(Clone, Default)]
+    struct MockRelayState {
+        sender_pk: String,
+        other_pk: String,
+        channel_type: String,
+        submitted: Option<serde_json::Value>,
+    }
+
+    fn mock_event_id() -> String {
+        "a".repeat(64)
+    }
+
+    fn mock_event_sig() -> String {
+        "b".repeat(128)
+    }
+
+    async fn spawn_mock_relay(other_pk: String) -> (String, Arc<Mutex<MockRelayState>>) {
+        let state = Arc::new(Mutex::new(MockRelayState {
+            other_pk,
+            channel_type: "dm".to_string(),
+            ..Default::default()
+        }));
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .route("/events", post(events_handler))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), state)
+    }
+
+    async fn query_handler(
+        State(state): State<Arc<Mutex<MockRelayState>>>,
+        Json(filters): Json<Vec<serde_json::Value>>,
+    ) -> Json<serde_json::Value> {
+        let filter = filters.first().cloned().unwrap_or(json!([]));
+        let channel_id = filter
+            .get("#d")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let kinds = filter
+            .get("kinds")
+            .and_then(|k| k.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let state = state.lock().unwrap();
+
+        if kinds.iter().any(|k| k.as_u64() == Some(39000)) {
+            return Json(json!([{
+                "id": mock_event_id(),
+                "pubkey": "0000000000000000000000000000000000000000000000000000000000000001",
+                "kind": 39000,
+                "created_at": 1700000000,
+                "tags": [["d", channel_id], ["t", &state.channel_type], ["hidden"]],
+                "content": "",
+                "sig": mock_event_sig()
+            }]));
+        }
+
+        if kinds.iter().any(|k| k.as_u64() == Some(39002)) {
+            return Json(json!([{
+                "id": mock_event_id(),
+                "pubkey": "0000000000000000000000000000000000000000000000000000000000000001",
+                "kind": 39002,
+                "created_at": 1700000000,
+                "tags": [
+                    ["d", channel_id],
+                    ["p", &state.sender_pk, "", "member"],
+                    ["p", &state.other_pk, "", "member"]
+                ],
+                "content": "",
+                "sig": mock_event_sig()
+            }]));
+        }
+
+        Json(json!([]))
+    }
+
+    async fn events_handler(
+        State(state): State<Arc<Mutex<MockRelayState>>>,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        state.lock().unwrap().submitted = Some(event);
+        (
+            StatusCode::OK,
+            json!({
+                "event_id": mock_event_id(),
+                "accepted": true,
+                "message": ""
+            })
+            .to_string(),
+        )
+    }
+
+    fn p_tag_pubkeys(event: &serde_json::Value) -> Vec<String> {
+        event
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|tag| {
+                        let arr = tag.as_array()?;
+                        if arr.first()?.as_str()? == "p" {
+                            arr.get(1)?.as_str().map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn dm_send_auto_ptags_recipients() {
+        let (url, state) = spawn_mock_relay(DM_PEER_PK.to_string()).await;
+        let keys = Keys::generate();
+        let client = BuzzClient::new(url, keys, None, None).unwrap();
+        state.lock().unwrap().sender_pk = client.keys().public_key().to_hex();
+
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let result = cmd_send_message(
+            &client,
+            SendMessageParams {
+                channel_id,
+                content: "hi".to_string(),
+                kind: None,
+                reply_to: None,
+                broadcast: false,
+                files: vec![],
+                mentions: vec![],
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "dm send failed: {result:?}");
+
+        let event = state
+            .lock()
+            .unwrap()
+            .submitted
+            .clone()
+            .expect("event was submitted");
+        let p_tags = p_tag_pubkeys(&event);
+        assert!(
+            p_tags.contains(&DM_PEER_PK.to_string()),
+            "DM peer must be p-tagged; got {p_tags:?}"
+        );
+        assert!(
+            !p_tags.contains(&client.keys().public_key().to_hex()),
+            "sender must not be p-tagged unless explicitly mentioned"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_send_does_not_auto_ptag_members() {
+        let (url, state) = spawn_mock_relay(DM_PEER_PK.to_string()).await;
+        let keys = Keys::generate();
+        let client = BuzzClient::new(url, keys, None, None).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.sender_pk = client.keys().public_key().to_hex();
+            s.channel_type = "stream".to_string();
+        }
+
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let result = cmd_send_message(
+            &client,
+            SendMessageParams {
+                channel_id,
+                content: "hi".to_string(),
+                kind: None,
+                reply_to: None,
+                broadcast: false,
+                files: vec![],
+                mentions: vec![],
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "stream send failed: {result:?}");
+
+        let event = state
+            .lock()
+            .unwrap()
+            .submitted
+            .clone()
+            .expect("event was submitted");
+        let p_tags = p_tag_pubkeys(&event);
+        assert!(
+            p_tags.is_empty(),
+            "stream send without mentions must not p-tag members; got {p_tags:?}"
+        );
     }
 }
