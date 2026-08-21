@@ -361,6 +361,7 @@ export const MessageRow = React.memo(
     }, [collapseDepthGuideActions]);
     const getTag = (name: string) =>
       message.tags?.find((tag) => tag[0] === name)?.[1];
+    const isThreadReplyLayout = layoutVariant === "thread-reply";
 
     const renderBody = () => {
       switch (message.kind) {
@@ -437,13 +438,13 @@ export const MessageRow = React.memo(
               snapshotSharedBy={snapshotSharedBy}
               videoReviewCommentRootId={videoReviewCommentRootId}
               videoReviewContext={videoReviewContext}
+              wrapTables={isThreadReplyLayout}
             />
           );
         }
       }
     };
 
-    const isThreadReplyLayout = layoutVariant === "thread-reply";
     const guideBleedRem = isThreadReplyLayout ? 0.25 : 0;
     const avatarButtonRadiusClass = "rounded-full";
 

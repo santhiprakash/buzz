@@ -104,4 +104,6 @@ export type MarkdownProps = {
    * a nudge card.
    */
   configNudgeAuthorPubkey?: string | null;
+  /** Wrap markdown tables to the container width (thread panel replies). */
+  wrapTables?: boolean;
 };

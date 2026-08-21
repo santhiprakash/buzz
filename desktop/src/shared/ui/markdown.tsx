@@ -1259,7 +1259,9 @@ function ImageMosaic({ children }: { children: React.ReactNode[] }) {
 export function createMarkdownComponents(
   interactive = true,
   mediaInset = false,
+  wrapTables = false,
 ): Components {
+  const cellClass = wrapTables ? "break-words" : "";
   const listItemClassName = "[&_p]:inline";
   const listClassName = "space-y-1 pl-6 marker:text-muted-foreground/80";
 
@@ -1583,14 +1585,26 @@ export function createMarkdownComponents(
     strong: ({ children }) => (
       <strong className="font-semibold">{children}</strong>
     ),
-    table: ({ children }) => <MarkdownTable>{children}</MarkdownTable>,
+    table: ({ children }) => (
+      <MarkdownTable wrap={wrapTables}>{children}</MarkdownTable>
+    ),
     td: ({ children }) => (
-      <td className="border-t border-border/70 px-3 py-2 align-top">
+      <td
+        className={cn(
+          "border-t border-border/70 px-3 py-2 align-top",
+          cellClass,
+        )}
+      >
         {children}
       </td>
     ),
     th: ({ children }) => (
-      <th className="bg-muted/60 px-3 py-2 font-semibold text-foreground">
+      <th
+        className={cn(
+          "bg-muted/60 px-3 py-2 font-semibold text-foreground",
+          cellClass,
+        )}
+      >
         {children}
       </th>
     ),
@@ -1703,11 +1717,11 @@ export function createMarkdownComponents(
 }
 
 /**
- * The component map only varies by the three boolean render flags, so at most
- * eight instances ever exist. Module-stable maps mean cached markdown element
+ * The component map only varies by the boolean render flags, so at most
+ * sixteen instances ever exist. Module-stable maps mean cached markdown element
  * trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
  */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "8";
+const MARKDOWN_COMPONENT_SCHEMA_VERSION = "9";
 const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
 
 type MarkdownComponentSet = { components: Components; variant: string };
@@ -1720,12 +1734,13 @@ function getMarkdownComponents(
   interactive: boolean,
   leadingInlineContent: boolean,
   mediaInset: boolean,
+  wrapTables: boolean,
 ): MarkdownComponentSet {
-  const variant = `${MARKDOWN_COMPONENT_SCHEMA_VERSION}:${interactive ? "i" : ""}${leadingInlineContent ? "l" : ""}${mediaInset ? "m" : ""}`;
+  const variant = `${MARKDOWN_COMPONENT_SCHEMA_VERSION}:${interactive ? "i" : ""}${leadingInlineContent ? "l" : ""}${mediaInset ? "m" : ""}${wrapTables ? "w" : ""}`;
   let entry = markdownComponentsByVariant.get(variant);
   if (!entry) {
     entry = {
-      components: createMarkdownComponents(interactive, mediaInset),
+      components: createMarkdownComponents(interactive, mediaInset, wrapTables),
       variant,
     };
     markdownComponentsByVariant.set(variant, entry);
@@ -1754,6 +1769,7 @@ function MarkdownInner({
   searchQuery,
   snapshotSharedBy,
   videoReviewContext,
+  wrapTables = false,
 }: MarkdownProps) {
   const { channels: rawChannels } = useChannelNavigation();
   const channels = useStableArray(rawChannels);
@@ -1857,6 +1873,7 @@ function MarkdownInner({
     interactive,
     hasLeadingInlineContent,
     mediaInset,
+    wrapTables,
   );
   const markdownNode =
     configNudge === null
